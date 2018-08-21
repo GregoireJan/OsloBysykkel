@@ -249,7 +249,7 @@ merge$elev &lt;- NA
 while( anyNA(merge$elev) ) {
   for( i in 1:nrow(merge) ) {
     if( is.na(merge[i,&quot;elev&quot;]) ) {
-      merge$elev[i] &lt;- elevation(latitude = merge$latitude[i],longitude = merge$longitude[i],key=&quot;AIzaSyDNprUiWav_glWs0uFbCwCCuf2SDdIVGos&quot;)[[3]]
+      merge$elev[i] &lt;- elevation(latitude = merge$latitude[i],longitude = merge$longitude[i],key=gapi)[[3]]
     }
   }
 }</code></pre>

@@ -144,7 +144,7 @@ merge$elev <- NA
 while( anyNA(merge$elev) ) {
   for( i in 1:nrow(merge) ) {
     if( is.na(merge[i,"elev"]) ) {
-      merge$elev[i] <- elevation(latitude = merge$latitude[i],longitude = merge$longitude[i],key="AIzaSyDNprUiWav_glWs0uFbCwCCuf2SDdIVGos")[[3]]
+      merge$elev[i] <- elevation(latitude = merge$latitude[i],longitude = merge$longitude[i],key=gapi)[[3]]
     }
   }
 }
