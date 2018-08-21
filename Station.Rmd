@@ -1,0 +1,433 @@
+---
+title: "Frequency of Bicycle Station usage in Oslo"
+author: "G. Jan"
+date: "19 August 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+#knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Intro
+
+In recent years bicycle sharing has become more and more present in Oslo. It provides an alternative to other modes of transport as well as filling the gaps left by public transports. They are many benefits provided by bicycle sharing: times of commuting trips can be potentially reduced, no bicycle theft, health improvement...
+
+The main objective of this paper is to brush some initial ideas on which factors influence the frequency usage of the bicycle stations and to quantify them. Those factors will be used in order to predict wether a bicycle station has a low or high frequency usage. You can find all the R code used for this work [here](https://github.com/GregoireJan/OsloBysykkel).
+
+The rest of the paper is organized as follows:
+
+1. Data handling
+    + Importing & Cleaning Data
+    + Exploring Data through Visualizations
+2. Data analysis
+    + Data splitting
+    + Logit regression
+    + Naive Bayes
+    + Decision Tree
+    + SVM
+3. Conclusion
+
+# Data Handling
+
+##Importing & Cleaning Data
+
+This section shows the importing and cleaning data process in order to get it ready for data exploration. The final data frame includes the following variables for each bicycle station: ID, Title, Subtitle, Neighborhood, Longitude, Latitude, Elevation, FrequencyStart, FrequencyEnd, FrequencyTotal, FrequencyFactor, TotalPopulation, RatioYoungPopulation, Transport, DistanceSentrum, NumberLocks. 
+
+Those variables were chosen according to the available open-source data at my disposition as well as time constrain.
+
+The following R libraries are used for all the subsequent coding.
+
+```{r, message=FALSE,warning=FALSE}
+# Libraries
+library(jsonlite)
+library(rgbif)
+library(ggmap)
+library(dplyr)
+library(stringr)
+library(leaflet)
+library(XML)
+library(NISTunits)
+library(caret)
+library(mltools)
+library(e1071)
+library(rpart)
+library(kernlab)
+```
+
+The first step is to import the data from the Oslo Bysykkel API (https://developer.oslobysykkel.no/api). The json file is downloaded using the following curl command. 
+
+```{eval = FALSE}
+curl -H "Client-Identifier: b57bc989e4b96f1040aa1752e98780c9" https://oslobysykkel.no/api/v1/stations
+```
+
+From the JSON file we can get the address of each station from the latitude and longitude coordinates using the google API. From the address we only keep the postcode and the following variables: id, title, subtitle, number_of_locks, longitude and latitude.
+
+```{r, cache=TRUE, message=FALSE,warning=FALSE}
+# Read oslo bysykkel station JSON file
+
+#  Mined from https://developer.oslobysykkel.no/api
+st <- fromJSON("/home/greg/Documents/Candidature/Bysykkel/oslobysykkel_station.json")
+station <- st$stations
+
+station$longitude <- station$center$longitude
+station$latitude <- station$center$latitude
+
+station$address <- NA
+
+# Get address from latitude and longitude using google API 
+while( anyNA(station$address) ) {
+  for( i in 1:nrow(station) ) {
+    if( is.na(station[i,"address"]) ) {
+      station$address[i] <- revgeocode( as.numeric(station[i, c("longitude","latitude")]), output = "address" )
+    }
+  }
+}
+
+# Create postcode variable from address
+station$postcode <- str_extract(station$address, "[0-9]{4}")
+# Keep the following variables: id. title, subtitle, number_of_locks, longitude,latitude,postcode
+station2 <- station[,c(1,3,4,5,8,9,11)]
+```
+
+The next step is to extract the neighborhood name from each stations postcode. This will be done using a csv table from https://www.erikbolstad.no/postnummer-koordinatar/txt/postnummer.csv.
+
+```{r, cache=TRUE, message=FALSE}
+# Read post number to get neighborhood name using https://www.erikbolstad.no/postnummer-koordinatar/txt/postnummer.csv
+
+postnum <- read.csv("/home/greg/Documents/Candidature/Bysykkel/postnummer.csv",sep="\t")
+postoslo <- postnum[postnum$POSTSTAD=="Oslo",c(3,6)]
+postoslo$POSTNR..OG.STAD <- gsub("OSLO","",postoslo$POSTNR..OG.STAD)
+names(postoslo) <- c("postcode","Bydel")
+
+# Prepare variable for merging to get neighborhood for each bicycle station
+postoslo$Bydel <- as.character(postoslo$Bydel)
+station2$postcoden <- as.numeric(station$postcode)
+postoslo$postcoden <- as.numeric(postoslo$postcode)
+# Left outer join
+merge <- merge(station2,postoslo,by="postcoden",all.x=TRUE,sort=FALSE)
+merge <- merge[,c(2:7,10)]
+merge$Bydel <- as.character(merge$Bydel)
+```
+
+Since the neighborhood name is now known for each station we can get the following variables: Total Population and the ratio young over old people in the neighborhoods. We will consider that the young people ranges from 16 to 39 years old and the old people ranges from 40 to 79 years old. The ratio will give us an indication on how young is the population in the given neighborhood.
+
+```{r, cache=TRUE, message=FALSE}
+# Import data for each neighborhood
+
+# Data from https://www.ssb.no/a/kortnavn/folkemengde/tab-2012-03-14-22.html
+folk <- read.table("/home/greg/Documents/Candidature/Bysykkel/bydelfolk.csv",sep = ",")
+names(folk) <- c("Bydel","TotalPop","0","1-4","5","6-12","13-15","16-19","20-39","40-54","55-66","67-79","80-89","90-")
+folk$Bydel<- gsub("[0-9]","",folk$Bydel)
+folk$Bydel<- gsub("^ ","",folk$Bydel)
+folk$Bydel<- gsub("St. Hanshaugen","St.Hanshaugen",folk$Bydel)
+folk <- folk[2:19,]
+folk[,2:14] <- as.data.frame(lapply(folk[,2:14], function(x) as.numeric(as.character(gsub(" ","",x)))))
+folk$Young <- folk$`20-39`+ folk$`16-19`
+folk$Old <- folk$`40-54`+folk$`55-66`+folk$`67-79`
+folk$RatioYoungPop <- folk$Young/(folk$Young+folk$Old)
+
+# Get population and age ratio for each neighborhood into main data.frame
+merge <- merge(merge,folk[,c("Bydel","TotalPop","RatioYoungPop")],by="Bydel",all.x=TRUE,sort = FALSE)
+```
+
+The following step computes the elevations for each station using the Google API.
+
+```{r, cache=TRUE, message=FALSE}
+# Get elevation for bicycle stations
+
+merge$elev <- NA
+
+# Use google api to get elevation of each bicycle station
+while( anyNA(merge$elev) ) {
+  for( i in 1:nrow(merge) ) {
+    if( is.na(merge[i,"elev"]) ) {
+      merge$elev[i] <- elevation(latitude = merge$latitude[i],longitude = merge$longitude[i],key="AIzaSyDNprUiWav_glWs0uFbCwCCuf2SDdIVGos")[[3]]
+    }
+  }
+}
+```
+
+This step is designed to extract the frequency of each station from April to December 2017 (1 year bicycle sharing activity in Oslo). The data is imported from https://developer.oslobysykkel.no/data. In addition to the total frequency we compute frequencies of both the starting and ending trip.
+
+```{r, cache=TRUE, message=FALSE,warning=FALSE}
+# Get all trafic for each station from april to december 2017
+
+url <- NA
+dest <- NA
+for (i in 18:26) {
+  url[i-17] <- paste("https://developer.oslobysykkel.no/data/",i,sep="")
+  dest[i-17] <- paste("/home/greg/Documents/Candidature/Bysykkel/",paste(i,"_2017.csv",sep=""),sep = "")}
+url <- paste(url,".csv",sep = "")
+for (i in 1:9) {
+download.file(url[i],dest[i],mode = "wb")}
+
+# Merge all csv files together
+setwd("/home/greg/Documents/Candidature/Bysykkel/")
+lapply(list.files(pattern="*_2017.zip"),unzip)
+trips <- do.call(rbind,lapply(list.files(pattern="trips-2017*"),read.csv))
+# Get frequency for starting and ending trips
+tripstart <- as.data.frame(table(trips$Start.station),col.names=c("Start.station","Freq"))
+names(tripstart) <- c("Start.station","FreqStart")
+tripend <- as.data.frame(table(trips$End.station),col.names=c("End.station","Freq"))
+names(tripend) <- c("End.station","FreqEnd")
+
+# Merge starting and ending trips with main data frame 
+merge2 <- merge(merge,tripstart,by.x="id",by.y="Start.station",all.x=TRUE,sort=FALSE)
+merge2 <- merge(merge2,tripend,by.x="id",by.y="End.station",all.x=TRUE,sort=FALSE)
+
+# Compute total frequency for each station
+merge2$FreqTotal <- merge2$FreqStart + merge2$FreqEnd
+# Compute difference between starting and ending for each station
+merge2$FreqDiff <- merge2$FreqStart - merge2$FreqEnd
+```
+
+The last step on this section is using XML data sets of all the transport stations in Oslo from the Statistik Sentralbyrå (https://storage.googleapis.com/marduk-production/tiamat/Oslo_og_Akershus_latest.zip). For each bicycle station we compute the number of public transport stations within 300 meter, a walk-able distance. In addition the distance from each bicycle station to the center (Oslo Domkirke) is also computed.
+
+```{r, cache=TRUE, message=FALSE}
+# Import transport stops info for Oslo
+# https://storage.googleapis.com/marduk-production/tiamat/Oslo_og_Akershus_latest.zip
+
+xmlfile <- xmlTreeParse("/home/greg/Documents/Candidature/Bysykkel/Oslo_og_Akershus-export-20180802-013420-13604389.xml",useInternalNodes=TRUE)
+xmllist <- xmlToList(xmlfile)
+xmlstop <- xmllist$dataObjects$SiteFrame$stopPlaces
+
+name <- NA
+longitude <- NA
+latitude <- NA
+TransportMode <- NA
+
+# Extract name, latitude, longitude for each transport station
+for (i in seq(length(xmlstop))) {
+  name[i] <- xmlstop[i][["StopPlace"]][["Name"]][["text"]]
+  longitude[i] <- xmlstop[i][["StopPlace"]][["Centroid"]][["Location"]][["Longitude"]]
+  latitude[i] <- xmlstop[i][["StopPlace"]][["Centroid"]][["Location"]][["Latitude"]]
+  ifelse(is.null(xmlstop[[i]]$TransportMode),TransportMode[i]<-NA,TransportMode[i] <-xmlstop[[i]]$TransportMode)
+}
+stop <- as.data.frame(cbind(name,longitude,latitude,TransportMode),stringsAsFactors = FALSE)
+stop2 <- na.omit(stop)
+
+# Compute the number of transport station less than than 300m next to each bicycle stations 
+merge2$transport <- 0
+for (i in seq(nrow(merge2))) {
+    lat <- merge2[i,"latitude"]
+    lon <- merge2[i,"longitude"]
+    n <- 0
+    for (j in seq(nrow(stop2))) {
+      R <-  6371e3
+      t1 <- NISTdegTOradian(lat)
+      t2 <- NISTdegTOradian(as.numeric(stop2[j,"latitude"]))
+      dt <- NISTdegTOradian(as.numeric(stop2[j,"latitude"])-lat)
+      da <- NISTdegTOradian(as.numeric(stop2[j,"longitude"])-lon)
+
+      a = sin(dt/2) * sin(dt/2) + cos(t1) * cos(t2) *  sin(da/2) * sin(da/2)
+      c = 2 * atan2(sqrt(a), sqrt(1-a))
+      d = R * c
+      if (d < 300) {n <- n + 1}
+    }
+    merge2[i,"transport"] <- n
+}
+# Compute the distance to the sentrum  (Oslo domkirke) for each bicycle stations
+for (i in seq(nrow(merge2))) {
+  lat <- merge2[i,"latitude"]
+  lon <- merge2[i,"longitude"]
+  R <-  6371e3
+  t1 <- NISTdegTOradian(lat)
+  t2 <- NISTdegTOradian(59.912592)
+  dt <- NISTdegTOradian(59.912592-lat)
+  da <- NISTdegTOradian(10.746755-lon)
+    
+  a = sin(dt/2) * sin(dt/2) + cos(t1) * cos(t2) *  sin(da/2) * sin(da/2)
+  c = 2 * atan2(sqrt(a), sqrt(1-a))
+  merge2[i,"DistSentrum"] <- R * c
+}
+
+merge.final<- na.omit(merge2)
+```
+
+##Exploring Data through Visualizations
+
+Let us have a look first at the Total Frequency variable.
+
+```{r, eval=TRUE, cache=TRUE,message=FALSE}
+library(ggplot2)
+ 
+ggplot(merge.final, aes(x=FreqTotal)) + geom_histogram(binwidth = 5000,fill="lightblue",color="black") + scale_x_continuous(breaks = seq(0,200000,by=10000)) + theme_classic() + theme(axis.text.x = element_text(angle=45,vjust = 0.65)) + xlab("Total Frequency (number of people)") + ylab("Number of bicycle stations") + ggtitle("Histogram of Total Frequency over a year (2017)")
+```
+
+The histogram shows that the number of bicycle stations is clearly exponentially decreasing with Total Frequency. We can see that the highest ranges are 0-2500 and 2500-7500 people which are the 2 first ranges. From this observation we derive a binary Total Frequency Factor whose values 0 and 1 are respectively defining Low and High Total Frequency with a threshold at 7500 people. This variable will be the outcome of our prediction. The reasons behind this choice is that predicting a binary outcome is simpler and is an acceptable first step in this work at the current stage.
+
+The following box plot show each variable which will be used in the prediction versus the Frequency Factor.
+
+```{r, eval=TRUE, cache=TRUE,message=FALSE}
+# Compute simple binary variable for low vs high frequency station: threshold at 7500ppl 
+merge.final$FreqTotF <- cut(merge.final$FreqTotal,breaks = c(0,7500,Inf),labels = c(0,1))
+
+
+library(gridExtra)
+p1 <- ggplot(merge.final, aes(x=FreqTotF,y=DistSentrum,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Distance to \n center (m)",x="Frequency Factor")
+p2 <- ggplot(merge.final, aes(x=FreqTotF,y=elev,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Elevation (m)",x="Frequency Factor")
+p3 <- ggplot(merge.final, aes(x=FreqTotF,y=number_of_locks,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Number \n of locks",x="Frequency Factor")
+p4 <- ggplot(merge.final, aes(x=FreqTotF,y=TotalPop,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Total Population \n in neighborhood",x="Frequency Factor")
+p5 <- ggplot(merge.final, aes(x=FreqTotF,y=RatioYoungPop,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Ratio Young \n people in neighborhood",x="Frequency Factor")
+p6 <- ggplot(merge.final, aes(x=FreqTotF,y=transport,group=FreqTotF)) + geom_boxplot(fill='#A4A4A4', color="black") + labs(y="Number of pucblic \n transport stations",x="Frequency Factor")
+grid.arrange(p1, p2,p3,p4,p5,p6, nrow = 3,ncol = 2)
+
+```
+
+The box plots show that the Distance to center, the elevation and the Ratio of Young people seems to have significantly different  means between Low and High frequency stations. Outliers (black dots) are present for some of those variables. The next chunk of code will output those values.
+
+```{r, eval=TRUE, cache=TRUE,message=FALSE}
+box <- as.list("Outliers")
+box$"Distance to center" <- boxplot.stats(merge.final$DistSentrum)$out
+box$"Elevation" <- boxplot.stats(merge.final$elev)$out 
+box$"Number of locks" <- boxplot.stats(merge.final$number_of_locks)$out 
+box$"Total Population in neighborhood" <- boxplot.stats(merge.final$TotalPop)$out 
+box$"Ratio Young  people in neighborhood" <- boxplot.stats(merge.final$RatioYoungPop)$out 
+box$"Number of public transport stations" <- boxplot.stats(merge.final$transport)$out 
+print(box)
+```
+
+Looking at the values seen as outliers I am confident that those values should remain in the data. None of them looks inapropriate.
+
+The next 2 plots are maps of Oslo with all the Bysykkel stations respectively showing the Total Frequency and the Frequency Factor. By clicking on the dots one can see the name and the frequency of the selected station.
+
+```{r, eval=TRUE, cache=TRUE,message=FALSE}
+library(leaflet)
+ pal <- colorNumeric(
+   palette = 'Reds',
+   domain = merge.final$FreqTotal)
+ 
+leaflet() %>% addTiles() %>% addCircleMarkers(data = merge.final ,lat = ~latitude, lng = ~longitude,stroke=FALSE,fillColor=~pal(FreqTotal),fillOpacity = 0.75,popup = ~paste(sep = "<br/>",title,as.character(FreqTotal))) %>% addLegend(pal = pal,values=  merge.final$FreqTotal,title="Total Frequency (2017)")
+```
+
+```{r, eval=TRUE, cache=TRUE,message=FALSE}
+library(leaflet)
+ pal <- colorFactor(
+   palette = 'Blues',
+   domain = as.factor(merge.final$FreqTotF))
+ 
+leaflet() %>% addTiles() %>% addCircleMarkers(data = merge.final ,lat = ~latitude, lng = ~longitude,stroke=FALSE,fillColor=~pal(as.factor(FreqTotF)),fillOpacity = 0.75,popup = ~paste(sep = "<br/>",title,as.character(FreqTotal))) %>% addLegend(pal = pal,values=  as.factor(merge.final$FreqTotF),title = "Frequency Factor")
+```
+
+Finally we look at the number of Low and High frequency bicycle stations.
+
+```{r, eval=TRUE, cache=TRUE}
+ggplot(as.data.frame(table(merge.final$FreqTotF)), aes(x=Var1,y=Freq)) + geom_bar(stat = "identity") + labs(x="Frequency Factor",y="Total Number")
+```
+
+We can clearly see that there are much less Low frequency stations making 26.5% of our data sets.
+
+#Data Analysis
+
+Since we now have a data frame with all our variables we can apply some machine learning algorithms in order to predict the Frequency Factor and assess the accuracy of their outcomes. The Frequency Factor is a simple binary Classifier so I have selected a few of the classifier algorithms.
+
+In order to evaluate each outcomes we will use confusion matrix and Mathews Correlation Coefficients. MCC is a correlation coefficient between target and predictions. It generally varies between -1 and +1. -1 when there is perfect disagreement between actuals and prediction, 1 when there is a perfect agreement between actuals and predictions. 0 when the prediction may as well be random with respect to the actuals.
+
+## Data splitting
+
+``` {r, eval  = TRUE,message=FALSE}
+# Data slicing : training and validation dataset with 70% threshold
+set.seed(333)
+
+trainpart <- createDataPartition(y=merge.final$FreqTotF, p=0.7, list=FALSE)
+training <- merge.final[trainpart, ]
+testing <- merge.final[-trainpart, ]
+
+```
+
+We split our data set into one *training* set (to perform the prediction training) and one *testing* set (to assess the accuracy of our prediction). Since our data set is only made of 227 observation we use cross-validation. Essentially, cross-validation will iteratively split (5 times in this case) the training data set into two portions: a test and a training set. The prediction errors from each of the test sets are then averaged to determine the expected prediction error for the whole model. This is done to minimize any bias effect and overfitting.
+
+##Logit Regression Model
+
+Logistic regression is a popular statistical technique to predict binomial outcomes. It generates the coefficients (and its standard errors and significance levels) of a formula to predict a logit transformation of the probability of presence of the characteristic of interest:
+
+$$log(odds)=log(\frac{p}{1-p})=\beta_0 + \beta_1*X_1+\beta_2*X_2+ ... + \beta_i*X_i$$
+with $p$ the probability of success, $\beta$ the coefficients and $X$ the input features.
+
+
+``` {r, eval  = TRUE,message=FALSE}
+# Logit regression
+fitlg<- train(FreqTotF ~ elev + DistSentrum + RatioYoungPop + transport + number_of_locks + TotalPop,data=training,method='glm',family="binomial",trControl = trainControl(method = 'cv', number = 5))
+
+# Summary output with coefficients
+summary(fitlg)
+
+# Prediction and evaluations
+predlg <- predict(fitlg,newdata = testing)
+confusionMatrix(predlg,as.factor(testing$FreqTotF))
+mcc(preds = predlg,actuals = as.factor(testing$FreqTotF))
+```
+
+The accuracy rate is a bit higher than the no information rate which means that this prediction using the logit regression is a bit better than guessing. This is supported by the P-value (which is above 0.05) and the Mathews Correlation Coefficent. 
+
+## Naive Bayes
+
+Naive Bayes is called naive because it assumes that each input variable is independent. This is a strong assumption and unrealistic for real data, nevertheless, the technique is very effective on a large range of complex problems.
+The model is comprised of two types of probabilities that can be calculated directly from your training data:
+
+1) The probability of each class
+2) The conditional probability for each class given each x value. 
+
+``` {r, eval  = TRUE,message=FALSE, warning = FALSE}
+# Naive Bayse
+fitnb <- naiveBayes(FreqTotF ~ elev + DistSentrum + RatioYoungPop + transport + number_of_locks + TotalPop,
+                       data=training)
+
+# Prediction and evaluations
+prednb <- predict(fitnb,newdata = testing)
+confusionMatrix(prednb,as.factor(testing$FreqTotF))
+mcc(preds = prednb,actuals = as.factor(testing$FreqTotF))
+```
+
+The accuracy rate shows that the Naive Bayes model is doing  slightly better than the logit regression model. This is confirmed by a higher Mathews Correlation Coefficent. 
+
+##Decision Tree
+
+Decision tree builds classification or regression models in the form of a tree structure. It utilizes an if-then rule set which is mutually exclusive and exhaustive for classification. The rules are learned sequentially using the training data one at a time. Each time a rule is learned, the tuples covered by the rules are removed. This process is continued on the training set until meeting a termination condition.
+
+
+``` {r, eval  = TRUE,message=FALSE}
+fittree <- rpart(FreqTotF ~ elev + DistSentrum + RatioYoungPop + transport + number_of_locks + TotalPop,
+                 method="class", data=training)
+predtree <- predict(fittree,newdata = testing,type = "class")
+confusionMatrix(predtree,as.factor(testing$FreqTotF))
+mcc(preds = predtree,actuals = as.factor(testing$FreqTotF))
+```
+
+The accuracy rate shows that the Decision Tree model is not doing as well as the Logits regression nor the Naive Bayes. The sensitivity is very low in this prediction which means that it is not good at predicting Low Frequency stations. This is confirmed by a lower Mathews Correlation Coefficent. 
+
+##Support Vector Machine
+
+In SVM, a hyperplane (a line that splits the input variable space) is selected to best separate the points in the input variable space by their class. The SVM learning algorithm finds the coefficients that results in the best separation of the classes by the hyperplane.
+The distance between the hyperplane and the closest data points is referred to as the margin. The best or optimal hyperplane that can separate the two classes is the line that has the largest margin. Only these points are relevant in defining the hyperplane and in the construction of the classifier. These points are called the support vectors. They support or define the hyperplane.
+
+``` {r, eval  = TRUE,message=FALSE}
+levels(training$FreqTotF) <- c("Low", "High")
+fitsvm <- train(FreqTotF ~ elev + DistSentrum + RatioYoungPop + transport + number_of_locks + TotalPop, data = training,method = "svmRadial",
+                    preProc = c("center","scale"),
+                    metric="ROC",
+                    tuneLength = 5,
+                    trControl=trainControl(method="repeatedcv",   # 10fold cross validation
+                     repeats=5,		    # do 5 repititions of cv
+                     summaryFunction=twoClassSummary,	# Use AUC to pick the best model
+                     classProbs=TRUE))
+
+# Prediction and evaluations
+predsvm <- predict(fitsvm,newdata = testing)
+levels(testing$FreqTotF) <- c("Low", "High")
+confusionMatrix(predsvm,testing$FreqTotF)
+mcc(preds = predsvm,actuals = as.factor(testing$FreqTotF))
+```
+
+Since the accuracy rate is equal to the no information rate this prediction using SVM is as good as guessing. The SVM prediction is simply not predicting any Low Frequency stations.
+
+# Conclusion
+
+As seen in the previous section, none of the models gives a fuly satisfying predictions. However it seems like a simple Logit Regression or Naive Bayes model could be a good way forward.
+
+The results presented in this document are only showing the current state of this work. There is much more that could be done in order to get a better prediction. Since the accuracy is so far not very good on all the models it seems that there are some missing variables. Locations of cultural points (cinemas, restaurants, bars...) and work places are some important factors in bicycle sharing that could be critical to the prediction. Once those variables are imported and prove to increase the accuracy of the models we can select and fine tune one model.
+
+Once a good model is found to predict the Frequeny Factor we could consider using more frequency ranges to classify each stations or even to predict the Total Frequency.
