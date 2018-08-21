@@ -4,4 +4,6 @@ The main objective of this paper is to brush some initial ideas on which factors
 
 All the R code and origin of the data set used for this work are available in Station.Rmd.
 
+The html version of the paper is available here: http://rpubs.com/GregoireJan/OsloBysykkel
+
 This work was done using R and RStudio Version 1.1.453 
